@@ -24,7 +24,7 @@
         # };
 
         devShells.default = with pkgs; mkShell {
-          buildInputs = [ dhall-lsp-server cargo rustc ];
+          buildInputs = [ cargo rustc rustfmt ];
           RUST_SRC_PATH = rustPlatform.rustLibSrc;
         };
       });

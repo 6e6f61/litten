@@ -1,13 +1,13 @@
-use std::collections::HashMap;
-use serde::Deserialize;
-use thiserror::Error;
 use anyhow::Result;
-use std::sync::Arc;
-use tokio::task::JoinSet;
-use tokio::net::{TcpListener, TcpStream};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use regex::Regex;
+use serde::Deserialize;
 use serde_with::serde_as;
+use std::collections::HashMap;
+use std::sync::Arc;
+use thiserror::Error;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinSet;
 
 mod request;
 mod response;
@@ -24,8 +24,7 @@ pub struct Http {
 #[derive(Deserialize, Debug, Clone)]
 pub struct Service {
     pub listen: Vec<String>,
-    #[serde(rename = "serviceNames")]
-    pub service_names: Vec<String>,
+    pub service_names: Option<Vec<String>>,
     #[serde_as(as = "HashMap<_, _>")]
     #[serde(rename = "location")]
     pub locations: Vec<(String, Method)>,
@@ -35,13 +34,21 @@ pub struct Service {
 #[serde(tag = "method")]
 pub enum Method {
     #[serde(rename = "static")]
-    Static { root: Option<String>, alias: Option<String> },
+    Static(Static),
     #[serde(rename = "proxy")]
-    Proxy  {
+    Proxy {
         to: String,
-        #[serde(rename = "addHeaders")]
-        add_headers: HashMap<String, String>
+        add_headers: Option<HashMap<String, String>>,
     },
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(untagged)]
+pub enum Static {
+    // #[serde(rename = "root")]
+    Root { root: String },
+    // #[serde(rename = "alias")]
+    Alias { alias: String },
 }
 
 #[derive(Debug, Error)]
@@ -69,15 +76,13 @@ impl Http {
 impl Service {
     pub async fn service_all(self: Arc<Self>) -> Result<()> {
         let mut addresses = JoinSet::new();
-        
+
         // TODO: I feel this is a hack
         for i in 0..self.listen.len() {
             addresses.spawn({
                 // TODO: I feel this is a hack
                 let t_self = Arc::clone(&self);
-                async move {
-                    t_self.listen_to_address(i).await
-                }
+                async move { t_self.listen_to_address(i).await }
             });
         }
 
@@ -91,26 +96,35 @@ impl Service {
     pub async fn listen_to_address(&self, addr_idx: usize) -> Result<()> {
         let address = &self.listen[addr_idx];
         let listener = TcpListener::bind(&address).await?;
-    
-        info!("listening to http://{} for names {:?}", address, self.service_names);
+
+        // TODO: Not print None when no service names are given
+        info!(
+            "listening to http://{} for names {:?}",
+            address, self.service_names
+        );
         loop {
             let (socket, remote_addr) = listener.accept().await?;
-            info!("accepted request from {:?} -> {}", remote_addr.ip(), address);
-            socket.readable().await?;
             let mut raw_req = [0; 4096];
+
+            info!(
+                "accepted request from {:?} -> {}",
+                remote_addr.ip(),
+                address
+            );
+            socket.readable().await?;
             socket.try_read(&mut raw_req)?;
 
             let request = match Request::try_from(std::str::from_utf8(&raw_req)?) {
                 Ok(v) => v,
-                Err(e) => {
-                    warn!("dropping request: {}", e);
+                Err(_) => {
+                    Response::bad_request().write(socket).await?;
                     continue;
                 }
             };
 
             match request.method {
                 request::Method::Get => {
-                    self.get(socket, request.path).await.unwrap_or_else(|e| {
+                    self.get(socket, request).await.unwrap_or_else(|e| {
                         warn!("request failed: {}", e);
                     });
                 }
@@ -122,24 +136,30 @@ impl Service {
         }
     }
 
-    pub async fn get(&self, socket: TcpStream, path: String) -> Result<()> {
+    pub async fn get(&self, socket: TcpStream, request: Request) -> Result<()> {
         let Some((re, method)) = self.locations
             .iter()
             // TODO: Not this
             // Try to have Serde deserialize the field as a Regex in the first place
-            .find(|(regex, _)| { Regex::new(regex).unwrap().is_match(&path) })
-        else { error!("no match"); todo!() };
+            .find(|(regex, _)| { Regex::new(regex).unwrap().is_match(&request.path) })
+        else { unreachable!() };
 
-        info!("path {} matched {}", path, re);
-        
+        debug!("path {} matched {}", request.path, re);
+
         match method {
-            Method::Static { alias: Some(alias), .. } =>
-                Response::file(alias.to_owned())?.write(socket).await?,
-            Method::Static { root: Some(root), .. } =>
-                Response::path(root.to_owned() + &path)?.write(socket).await?,
-            x => {
-                info!("method {:?} is unsupported, failing", x);
-                return Ok(());
+            Method::Static(Static::Alias { alias }) => {
+                Response::file(alias.to_owned())?.write(socket).await?
+            }
+            Method::Static(Static::Root { root }) => {
+                Response::path(root.to_owned() + &request.path)?
+                    .write(socket)
+                    .await?
+            }
+            Method::Proxy { .. } => {
+                Response::proxy(request, method.clone())
+                    .await?
+                    .write(socket)
+                    .await?
             }
         }
 

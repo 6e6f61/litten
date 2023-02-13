@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use log::info;
+use log::{error, info};
 use tokio::task::JoinSet;
 
 mod configuration;
@@ -31,7 +31,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let conf_file = std::fs::read_to_string(args.config)?;
-    let configuration: Configuration = toml::from_str(&conf_file)?;
+    let configuration: Configuration = match toml::from_str(&conf_file) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("{}", e);
+            return Ok(());
+        }
+    };
     info!("parsed configuration ok");
 
     let mut services = JoinSet::new();

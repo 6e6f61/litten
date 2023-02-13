@@ -1,0 +1,37 @@
+[[http.service]]
+    # A list of address:port combinations for this service to listen
+    # on.
+    listen = [ '127.0.0.1:8080' ]
+    # Service names to listen for. Only requests with the HTTP Host
+    # header set to a value listed here will be served. If this list
+    # is empty, or missing, all requests are served.
+    service_names = [ 'example.com' ]
+
+    # When alias is used with the static method, requests
+    # to the location are always redirected to the alias.
+    # This location expects the HTTP request path to literally
+    # match the string "/secret".
+    [http.service.location.'/secret']
+        method = 'static'
+        alias = 'examples/easter_egg.html'
+
+    # When root is used with the static method, the requested
+    # path is looked up in the root directory.
+    # This location is a regex matching every request path
+    # starting with an /, i.e., all of them.
+    [http.service.location.'/.*']
+        method = 'static'
+        root = 'examples/root'
+
+[[http.service]]
+    listen = [ '127.0.0.1:8081' ]
+    
+    # The proxy method proxies requests through Litten to the
+    # destination given in `to`.
+    [http.service.location.'/.*']
+        method = 'proxy'
+        to = '127.0.0.1:8080'
+        # Headers given here will be appended to the list of headers
+        # sent in the proxied request - alongside all of the headers
+        # given in the original request.
+        add_headers = { 'X-My-Header' = '123' }

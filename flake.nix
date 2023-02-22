@@ -19,10 +19,6 @@
           buildInputs = with pkgs; [ ];
         };
 
-        # defaultApp.default = utils.lib.mkApp {
-        #   drv = self.defaultPackage."${system}";
-        # };
-
         devShells.default = with pkgs; mkShell {
           buildInputs = [ cargo rustc rustfmt ];
           RUST_SRC_PATH = rustPlatform.rustLibSrc;

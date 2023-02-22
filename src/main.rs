@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use log::{error, info};
-use tokio::task::JoinSet;
+use ractor::Actor;
 
 mod configuration;
 mod http;
@@ -40,15 +40,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     info!("parsed configuration ok");
 
-    let mut services = JoinSet::new();
-
     if let Some(http) = configuration.http {
-        services.spawn(async move { http.serve().await });
+        Actor::spawn(None, http, ());
     }
 
-    while let Some(svc) = services.join_next().await {
-        svc??;
-    }
-
-    Ok(())
+    loop { }
 }

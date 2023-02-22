@@ -1,18 +1,15 @@
 use anyhow::Result;
 use log::{debug, error, info, warn};
-use regex::Regex;
+// use regex::Regex;
 use serde::Deserialize;
 use serde_with::serde_as;
 use std::collections::HashMap;
-use std::sync::Arc;
+// use std::sync::Arc;
+use std::net::SocketAddr;
 use thiserror::Error;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinSet;
-
-mod request;
-mod response;
-use request::Request;
-use response::Response;
+use std::str::FromStr;
+use warp::Filter;
+use ractor::{Actor, ActorRef, ActorProcessingErr};
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct Http {
@@ -57,112 +54,77 @@ pub enum HttpError {
     ServeReturn,
 }
 
-impl Http {
-    pub async fn serve(self) -> Result<()> {
-        let mut services = JoinSet::new();
+#[derive(Debug, Clone)]
+pub enum Msg {
+    Init,
+}
 
-        for s in self.services {
-            services.spawn(async move { Arc::new(s).service_all().await });
+#[async_trait::async_trait]
+impl Actor for Http {
+    type Msg = Msg;
+    type Arguments = ();
+    type State = ();
+
+    async fn pre_start(&self, myself: ActorRef<Self>, _: Self::Arguments)
+        -> Result<Self::State, ActorProcessingErr>
+    {
+        myself.cast(Self::Msg::Init)?;
+        Ok(())
+    }
+
+    async fn handle(&self, myself: ActorRef<Self>, message: Self::Msg, _: &mut Self::State)
+    -> Result<Self::State, ActorProcessingErr>
+    {
+        // Assume the message is Init because it's the only one
+        for service in &self.services {
+            self.make_service(service).await?;
         }
 
-        while let Some(svc) = services.join_next().await {
-            svc??;
-        }
-
-        Err(HttpError::ServeReturn.into())
+        Ok(())
     }
 }
 
-impl Service {
-    pub async fn service_all(self: Arc<Self>) -> Result<()> {
-        let mut addresses = JoinSet::new();
-
-        // TODO: I feel this is a hack
-        for i in 0..self.listen.len() {
-            addresses.spawn({
-                // TODO: I feel this is a hack
-                let t_self = Arc::clone(&self);
-                async move { t_self.listen_to_address(i).await }
-            });
+impl Http {
+    async fn make_service(&self, service_cfg: &Service) -> Result<()> {
+        let mut svc_name_route = warp::any();
+        for service_name in service_cfg.service_names.unwrap_or_default() {
+            svc_name_route.or(warp::host::exact(&service_name));
         }
 
-        while let Some(addr) = addresses.join_next().await {
-            addr??;
-        }
-
-        Err(HttpError::ServeReturn.into())
-    }
-
-    pub async fn listen_to_address(&self, addr_idx: usize) -> Result<()> {
-        let address = &self.listen[addr_idx];
-        let listener = TcpListener::bind(&address).await?;
-
-        // TODO: Not print None when no service names are given
-        info!(
-            "listening to http://{} for names {:?}",
-            address, self.service_names
-        );
-        loop {
-            let (socket, remote_addr) = listener.accept().await?;
-            let mut raw_req = [0; 4096];
-
-            info!(
-                "accepted request from {:?} -> {}",
-                remote_addr.ip(),
-                address
-            );
-            socket.readable().await?;
-            socket.try_read(&mut raw_req)?;
-
-            let request = match Request::try_from(std::str::from_utf8(&raw_req)?) {
-                Ok(v) => v,
-                Err(_) => {
-                    Response::bad_request().write(socket).await?;
-                    continue;
-                }
-            };
-
-            match request.method {
-                request::Method::Get => {
-                    self.get(socket, request).await.unwrap_or_else(|e| {
-                        warn!("request failed: {}", e);
-                    });
-                }
-                _ => warn!(
-                    "dropping request with unimplemented method {:?}",
-                    request.method
-                ),
-            };
-        }
-    }
-
-    pub async fn get(&self, socket: TcpStream, request: Request) -> Result<()> {
-        let Some((re, method)) = self.locations
-            .iter()
-            // TODO: Not this
-            // Try to have Serde deserialize the field as a Regex in the first place
-            .find(|(regex, _)| { Regex::new(regex).unwrap().is_match(&request.path) })
-        else { unreachable!() };
-
-        debug!("path {} matched {}", request.path, re);
-
-        match method {
-            Method::Static(Static::Alias { alias }) => {
-                Response::file(alias.to_owned())?.write(socket).await?
-            }
-            Method::Static(Static::Root { root }) => {
-                Response::path(root.to_owned() + &request.path)?
-                    .write(socket)
-                    .await?
-            }
-            Method::Proxy { .. } => {
-                Response::proxy(request, method.clone())
-                    .await?
-                    .write(socket)
-                    .await?
+        let mut svc_routes = warp::any();
+        for location in service_cfg.locations {
+            match location {
+                (path, Method::Static(Static::Alias { alias })) =>
+                    svc_routes.or(warp::path(path).map(|| format!("Would've opened file {}", alias))),
+                (path, Method::Static(Static::Root { root })) =>
+                    svc_routes.or(warp::path(path).map(|| format!("Would've served from root {}", root))),
+                (path, Method::Proxy { to, add_headers }) =>
+                    unimplemented!(),
             }
         }
+        // let service_names = service_cfg.service_names
+        //     .unwrap_or_default()
+        //     .into_iter()
+        //     .fold(warp::any(), |svc, service_name| svc.or(warp::host::exact(&service_name)));
+        
+        // let routes = service_cfg.locations
+        //     .into_iter()
+        //     .fold(warp::any(), |svc, location| svc.or(
+        //         match location {
+        //             (path, Method::Static(Static::Alias { alias })) =>
+        //                 warp::path(path).map(|| format!("Would've opened file {}", alias)),
+        //             (path, Method::Static(Static::Root { root })) =>
+        //                 warp::path(path).map(|| format!("Would've served from root {}", root)),
+        //             (path, Method::Proxy { to, add_headers }) =>
+        //                 unimplemented!(),
+        //         }
+        //     ));
 
+        for listen in service_cfg.listen {
+            warp::serve(warp::get().and(svc_name_route).and(svc_routes))
+                .run(SocketAddr::from_str(&listen)?);
+        }
+    
         Ok(())
     }
 }
